@@ -1,0 +1,314 @@
+// =====================================================================
+// Azure Virtual Desktop - Security Alert Rule Queries
+// Companion to the GetToTheCloud AVD security series (Parts I-III)
+// Author: Alex ter Neuzen
+//
+// Each query is written to be used as the criteria of an Azure Monitor
+// scheduled query rule (Microsoft.Insights/scheduledQueryRules v2).
+//
+// PREREQUISITES differ per rule - read the header of each one.
+// Validate every table name against your own workspace before you deploy;
+// resource-specific tables only exist where the matching diagnostic
+// setting or data collection rule is in place.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// RULE 01 - Virtual Machine Administrator Login granted
+// Chain step cut: elevation (step 4)
+// Series reference: Part II, "RBAC is the load-bearing wall"
+// Requires: AzureActivity (Activity Log diagnostic setting -> workspace)
+// Suggested: every 5 min over 15 min, Severity 1, threshold > 0
+//
+// This is the highest-value rule in the whole set. It fires the moment
+// somebody grants local administrator rights on sessionhosts, which is
+// almost always a troubleshooting shortcut that never gets reverted.
+// ---------------------------------------------------------------------
+let VmAdminLoginRoleId = "1c0163c0-47e6-4577-8991-ea5c82e286e4";
+AzureActivity
+| where TimeGenerated > ago(15m)
+| where OperationNameValue =~ "MICROSOFT.AUTHORIZATION/ROLEASSIGNMENTS/WRITE"
+| where ActivityStatusValue in ("Success", "Succeeded")
+| extend RequestBody = tostring(parse_json(tostring(parse_json(Properties).requestbody)))
+| where RequestBody has VmAdminLoginRoleId
+| extend PrincipalId = tostring(parse_json(RequestBody).Properties.PrincipalId)
+| extend AssignedScope = tostring(parse_json(RequestBody).Properties.Scope)
+| project TimeGenerated, Caller, CallerIpAddress, PrincipalId, AssignedScope, _ResourceId
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// RULE 02 - Local Administrators group membership changed on a sessionhost
+// Chain step cut: elevation (step 4)
+// Series reference: Part II, "No standing local administrators"
+// Requires: SecurityEvent table - Security Events data collection rule
+//           scoped to the sessionhost VMs, collecting event 4732/4733.
+//           If you use Defender XDR tables instead, see RULE 02b.
+// Suggested: every 5 min over 10 min, Severity 1, threshold > 0
+//
+// Low noise, high signal. On a fleet where nobody should be local admin,
+// any hit is either an undocumented admin action or step four in progress.
+// ---------------------------------------------------------------------
+SecurityEvent
+| where TimeGenerated > ago(10m)
+| where EventID in (4732, 4733)          // member added to / removed from a security-enabled local group
+| where TargetAccount has "Administrators" or MemberName has "Administrators"
+| extend Action = iff(EventID == 4732, "Added to local group", "Removed from local group")
+| project TimeGenerated, Computer, Action, TargetAccount, MemberName, SubjectAccount, Activity
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// RULE 02b - Same detection via Defender for Endpoint tables
+// Requires: Microsoft Defender XDR connector in Sentinel (DeviceEvents)
+// Use this INSTEAD of RULE 02 if you are not collecting Security Events.
+// ---------------------------------------------------------------------
+// DeviceEvents
+// | where TimeGenerated > ago(10m)
+// | where ActionType == "UserAccountAddedToLocalGroup"
+// | where AdditionalFields has "Administrators"
+// | project TimeGenerated, DeviceName, AccountName, InitiatingProcessAccountName, AdditionalFields
+
+
+// ---------------------------------------------------------------------
+// RULE 03 - AVD sign-in that did not satisfy multi-factor authentication
+// Chain step cut: token (step 2)
+// Series reference: Part II, "Conditional Access, done specifically"
+// Requires: SigninLogs (Entra ID diagnostic setting -> workspace)
+// Suggested: every 15 min over 1 h, Severity 2, threshold > 0
+//
+// This is the rule that proves your Conditional Access policy actually
+// covers BOTH authentication applications rather than only one of them.
+// If it never fires, your policy is doing what you think it is.
+// ---------------------------------------------------------------------
+let AvdAppIds = dynamic([
+    "a4a365df-50f1-4397-bc59-1a1564b8bb9c",   // Microsoft Remote Desktop
+    "270efc09-cd0d-444b-a71f-39af4910ec45",   // Windows Cloud Login
+    "9cdead84-a844-4324-93f2-b2e6bb768d07"    // Azure Virtual Desktop
+]);
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where AppId in (AvdAppIds)
+| where ResultType == 0                                   // successful sign-in only
+| where AuthenticationRequirement == "singleFactorAuthentication"
+| summarize SignInCount = count(),
+            Locations = make_set(Location, 10),
+            IPs = make_set(IPAddress, 10)
+        by UserPrincipalName, AppDisplayName
+| order by SignInCount desc
+
+
+// ---------------------------------------------------------------------
+// RULE 04 - AVD sign-in from an unexpected country
+// Chain step cut: token (step 2)
+// Series reference: Part III, "What bad actually looks like"
+// Requires: SigninLogs
+// Suggested: every 15 min over 1 h, Severity 1, threshold > 0
+//
+// Tune AllowedCountries to your actual workforce. A tight, well-understood
+// allow list is what makes this rule high signal rather than noise.
+// ---------------------------------------------------------------------
+let AllowedCountries = dynamic(["NL", "BE", "DE", "GB"]);   // TUNE THIS
+let AvdAppIds = dynamic([
+    "a4a365df-50f1-4397-bc59-1a1564b8bb9c",
+    "270efc09-cd0d-444b-a71f-39af4910ec45",
+    "9cdead84-a844-4324-93f2-b2e6bb768d07"
+]);
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where AppId in (AvdAppIds)
+| where ResultType == 0
+| where isnotempty(Location) and Location !in (AllowedCountries)
+| extend City = tostring(parse_json(tostring(LocationDetails)).city)
+| project TimeGenerated, UserPrincipalName, AppDisplayName, Location, City, IPAddress, UserAgent
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// RULE 05 - Impossible travel into the host pool
+// Chain step cut: token (step 2)
+// Requires: SigninLogs
+// Suggested: every 30 min over 6 h, Severity 1, threshold > 0
+//
+// Two successful AVD sign-ins from different countries inside a window
+// too short to have travelled. Deliberately simple; Entra ID Protection
+// does this better if you are licensed for it.
+// ---------------------------------------------------------------------
+let AvdAppIds = dynamic([
+    "a4a365df-50f1-4397-bc59-1a1564b8bb9c",
+    "270efc09-cd0d-444b-a71f-39af4910ec45",
+    "9cdead84-a844-4324-93f2-b2e6bb768d07"
+]);
+SigninLogs
+| where TimeGenerated > ago(6h)
+| where AppId in (AvdAppIds)
+| where ResultType == 0
+| where isnotempty(Location)
+| summarize CountryCount = dcount(Location),
+            Countries = make_set(Location, 10),
+            IPs = make_set(IPAddress, 10),
+            FirstSeen = min(TimeGenerated),
+            LastSeen = max(TimeGenerated)
+        by UserPrincipalName
+| where CountryCount > 1
+| extend WindowMinutes = datetime_diff('minute', LastSeen, FirstSeen)
+| where WindowMinutes < 240
+| order by WindowMinutes asc
+
+
+// ---------------------------------------------------------------------
+// RULE 06 - Sessionhost egress denied by the firewall
+// Chain step cut: lateral movement (step 6)
+// Series reference: Part III, "Egress control, and the tuning problem"
+// Requires: Azure Firewall diagnostics in RESOURCE-SPECIFIC mode
+//           (AZFWApplicationRule / AZFWNetworkRule). If you use Azure
+//           diagnostics mode you will be querying AzureDiagnostics instead.
+// Suggested: every 15 min over 1 h, Severity 3, threshold > 20
+//
+// DO NOT deploy this until your egress rules are tuned. Until then every
+// missing FQDN is a deny and the rule is pure noise. Once the environment
+// is stable, a sessionhost reaching for somewhere its identical siblings
+// never reach is one of the better signals you have.
+// ---------------------------------------------------------------------
+let SessionHostPrefix = "10.10.20.";      // TUNE to your sessionhost subnet
+AZFWApplicationRule
+| where TimeGenerated > ago(1h)
+| where Action == "Deny"
+| where SourceIp startswith SessionHostPrefix
+| summarize DenyCount = count(),
+            Targets = make_set(Fqdn, 20)
+        by SourceIp, Protocol
+| where DenyCount > 20
+| order by DenyCount desc
+
+
+// ---------------------------------------------------------------------
+// RULE 07 - A sessionhost reaching a destination none of its siblings reach
+// Chain step cut: lateral movement (step 6)
+// Requires: AZFWApplicationRule, and a stable tuned baseline
+// Suggested: every 1 h over 24 h, Severity 2, threshold > 0
+//
+// Sessionhosts built from a common image behave almost identically. This
+// rule exploits that: it surfaces destinations contacted by exactly one
+// host in the pool over a day.
+// ---------------------------------------------------------------------
+let SessionHostPrefix = "10.10.20.";
+AZFWApplicationRule
+| where TimeGenerated > ago(24h)
+| where SourceIp startswith SessionHostPrefix
+| where isnotempty(Fqdn)
+| summarize HostCount = dcount(SourceIp),
+            Hosts = make_set(SourceIp, 5),
+            Hits = count()
+        by Fqdn
+| where HostCount == 1 and Hits > 5
+| order by Hits desc
+
+
+// ---------------------------------------------------------------------
+// RULE 08 - Mass FSLogix profile container mount failure
+// Chain step cut: data (step 5) - and a ransomware indicator
+// Series reference: Part III, "The profile containers are the crown jewels"
+// Requires: Event table with the Microsoft-FSLogix-Apps/Operational
+//           channel collected by a data collection rule, OR use the
+//           WVDErrors variant below.
+// Suggested: every 10 min over 30 min, Severity 1, threshold > 0
+//
+// Alert on the RATE, never the individual event. A handful of failed
+// mounts is a normal Monday. A spike across many users at once means
+// either your storage path is broken or something is encrypting the
+// containers. Both are incidents.
+// ---------------------------------------------------------------------
+Event
+| where TimeGenerated > ago(30m)
+| where Source has "FSLogix"
+| where EventLevelName in ("Error", "Warning")
+| where RenderedDescription has_any ("failed to attach", "cannot attach", "load profile", "mount")
+| summarize FailureCount = count(),
+            AffectedHosts = dcount(Computer),
+            Hosts = make_set(Computer, 20)
+        by bin(TimeGenerated, 10m)
+| where FailureCount > 10 or AffectedHosts > 3
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// RULE 09 - Storage account key authentication against the profile share
+// Chain step cut: data (step 5)
+// Series reference: Part III, profile storage hardening
+// Requires: Storage file diagnostic setting (StorageFileLogs) on the
+//           FSLogix storage account.
+// Suggested: every 30 min over 1 h, Severity 2, threshold > 0
+//
+// You moved to identity-based authentication in Part III. Anything still
+// authenticating with the account key is either a leftover configuration
+// or a shared credential in use. Both want investigating.
+// ---------------------------------------------------------------------
+StorageFileLogs
+| where TimeGenerated > ago(1h)
+| where AuthenticationType == "AccountKey"
+| summarize Operations = count(),
+            Callers = make_set(CallerIpAddress, 10),
+            OperationTypes = make_set(OperationName, 10)
+        by AccountName
+| order by Operations desc
+
+
+// ---------------------------------------------------------------------
+// RULE 10 - Public IP created in the sessionhost scope
+// Chain step cut: the whole inbound class
+// Series reference: Part III, "No public IPs"
+// Requires: AzureActivity
+// Suggested: every 15 min over 1 h, Severity 2, threshold > 0
+//
+// Belt and braces alongside an Azure Policy deny. Policy stops it; this
+// tells you somebody tried, which is the more useful half.
+// ---------------------------------------------------------------------
+AzureActivity
+| where TimeGenerated > ago(1h)
+| where OperationNameValue =~ "MICROSOFT.NETWORK/PUBLICIPADDRESSES/WRITE"
+| where ActivityStatusValue in ("Success", "Succeeded", "Start")
+| where _ResourceId has "/resourceGroups/rg-avd"      // TUNE to your sessionhost resource group
+| project TimeGenerated, Caller, CallerIpAddress, ActivityStatusValue, _ResourceId
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// RULE 11 - Sessionhost agent unhealthy or not registering
+// Chain step cut: none directly - this is the availability signal that
+//                 exposes a broken egress rule or a broken control plane path
+// Series reference: Part III, egress tuning and Private Link DNS
+// Requires: AVD host pool diagnostic settings -> workspace
+// Suggested: every 15 min over 1 h, Severity 2, threshold > 0
+//
+// A host that registers but will not accept connections is the classic
+// symptom of an over-tight firewall policy or a private DNS zone that is
+// resolving to somewhere the client cannot reach.
+// ---------------------------------------------------------------------
+WVDAgentHealthStatus
+| where TimeGenerated > ago(1h)
+| summarize arg_max(TimeGenerated, *) by SessionHostName
+| where Status != "Available" or tobool(AllowNewSessions) == false
+| project TimeGenerated, SessionHostName, Status, UpgradeState, LastHeartBeat, AllowNewSessions
+| order by SessionHostName asc
+
+
+// ---------------------------------------------------------------------
+// RULE 12 - Spike in failed AVD connections
+// Chain step cut: none directly - operational early warning
+// Series reference: Part III, "Three tools, three jobs"
+// Requires: AVD host pool diagnostic settings (WVDErrors, WVDConnections)
+// Suggested: every 15 min over 1 h, Severity 3, threshold > 0
+//
+// You will usually see the operational symptom of a security problem
+// before you see the security event itself. This is that symptom.
+// ---------------------------------------------------------------------
+WVDErrors
+| where TimeGenerated > ago(1h)
+| summarize ErrorCount = count(),
+            AffectedUsers = dcount(UserName),
+            Sources = make_set(Source, 10),
+            Codes = make_set(CodeSymbolic, 10)
+        by bin(TimeGenerated, 15m)
+| where ErrorCount > 25 or AffectedUsers > 5
+| order by TimeGenerated desc
