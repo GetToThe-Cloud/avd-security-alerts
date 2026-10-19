@@ -7,7 +7,7 @@ using './avd-security-alerts.bicep'
 
 // The Log Analytics workspace that receives AVD host pool diagnostics,
 // Entra ID sign-in logs, the Activity Log, firewall logs and host events.
-param workspaceResourceId = '/subscriptions/0c099ebb-b857-4ac4-98b6-b753e9dc4850/resourceGroups/rsg-lz-monitoring-01/providers/Microsoft.OperationalInsights/workspaces/law-lz-01'
+param workspaceResourceId = '/subscriptions/<subscriptionId>/resourceGroups/<resourceGroup>/providers/Microsoft.OperationalInsights/workspaces/<logAnalyticsWorkspaceName>'
 
 // Who gets the alerts. Ignored if actionGroupResourceId is set.
 param alertEmailAddresses = [
@@ -25,7 +25,7 @@ param namePrefix = 'avd-sec'
 param sessionHostSubnetPrefix = '10.0.0.'
 
 // The resource group holding the sessionhost virtual machines.
-param sessionHostResourceGroupName = 'rsg-avd-sessionhost-online-01'
+param sessionHostResourceGroupName = '<sessionhostResourceGroupName'
 
 // Countries your workforce legitimately signs in from. Keep this tight -
 // it is what makes the location rules high signal rather than noise.
